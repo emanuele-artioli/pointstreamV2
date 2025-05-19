@@ -172,20 +172,15 @@ def main():
         df = pd.DataFrame(df_rows, columns=df_columns)
         df.to_csv(csv_file_path, index=False)
 
-        shutil.make_archive(experiment_folder, 'zip', experiment_folder)
-        # shutil.rmtree(experiment_folder)
-
         # Call extract_pov.py for this video
         pov_script = os.path.join(os.path.dirname(__file__), "extract_pov.py")
         pov_image_dir = background_folder  # This is where inpainted backgrounds are saved
-        pov_output_dir = os.path.join(working_dir, "sfm_output", os.path.basename(vid).split(".")[0])
-        os.makedirs(pov_output_dir, exist_ok=True)  # Ensure output dir exists
         # Make sure the background frames are available before calling
         if os.path.exists(pov_image_dir) and len(os.listdir(pov_image_dir)) > 0:
             subprocess.run([
                 "python3", pov_script,
                 pov_image_dir,
-                pov_output_dir
+                experiment_folder
             ], check=True)
         else:
             print(f"[!] No background frames found in {pov_image_dir}, skipping SfM for this video.")
