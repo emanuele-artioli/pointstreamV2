@@ -6,6 +6,7 @@ import concurrent.futures
 from ultralytics import YOLO
 import numpy as np
 import pandas as pd
+import subprocess
 
 def extract_people(result):
     """Extracts person info (ID, confidence, bbox, keypoints) from a YOLO result into a dictionary."""
@@ -172,7 +173,23 @@ def main():
         df.to_csv(csv_file_path, index=False)
 
         shutil.make_archive(experiment_folder, 'zip', experiment_folder)
-        shutil.rmtree(experiment_folder)
+        # shutil.rmtree(experiment_folder)
+
+        # Call extract_pov.py for this video
+        pov_script = os.path.join(os.path.dirname(__file__), "extract_pov.py")
+        pov_image_dir = background_folder  # This is where inpainted backgrounds are saved
+        pov_output_dir = os.path.join(working_dir, "sfm_output", os.path.basename(vid).split(".")[0])
+        os.makedirs(pov_output_dir, exist_ok=True)  # Ensure output dir exists
+        # Make sure the background frames are available before calling
+        if os.path.exists(pov_image_dir) and len(os.listdir(pov_image_dir)) > 0:
+            subprocess.run([
+                "python3", pov_script,
+                pov_image_dir,
+                pov_output_dir
+            ], check=True)
+        else:
+            print(f"[!] No background frames found in {pov_image_dir}, skipping SfM for this video.")
+
 
     timing_df = pd.DataFrame(timing_data)
     timing_df.to_csv(timing_csv_path, index=False)
