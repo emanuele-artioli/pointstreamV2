@@ -7,6 +7,7 @@ from ultralytics import YOLO
 import numpy as np
 import pandas as pd
 import subprocess
+import sys
 
 def extract_people(result):
     """Extracts person info (ID, confidence, bbox, keypoints) from a YOLO result into a dictionary."""
@@ -56,6 +57,47 @@ def generate_mask(img, model, conf=0.01, iou=0.01, imgsz=None, device=None):
         person_mask = results[0].masks.data[0].cpu().numpy().astype(np.uint8) * 255
         mask = cv2.bitwise_or(mask, person_mask)
     return mask
+
+def estimate_camera_pose(img1, img2, K):
+    sift = cv2.SIFT_create()
+    kp1, des1 = sift.detectAndCompute(img1, None)
+    kp2, des2 = sift.detectAndCompute(img2, None)
+    matcher = cv2.BFMatcher()
+    matches = matcher.knnMatch(des1, des2, k=2)
+    good = []
+    for m, n in matches:
+        if m.distance < 0.75 * n.distance:
+            good.append(m)
+    if len(good) < 5:
+        return None, None
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in good])
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in good])
+    E, mask = cv2.findEssentialMat(pts1, pts2, K, method=cv2.RANSAC)
+    if E is None:
+        return None, None
+    _, R, t, _ = cv2.recoverPose(E, pts1, pts2, K)
+    rvec, _ = cv2.Rodrigues(R)
+    return rvec.flatten(), t.flatten()
+
+def compute_camera_poses(background_folder, experiment_folder):
+    background_frames = [bg for bg in os.listdir(background_folder) if bg.endswith(('.jpg', '.png'))]
+    background_frames.sort()
+    poses = pd.DataFrame(columns=['frame_id', 'rvec_x', 'rvec_y', 'rvec_z', 't_x', 't_y', 't_z'])
+    for i in range(len(background_frames) - 1):
+        img1 = cv2.imread(os.path.join(background_folder, background_frames[i]))
+        img2 = cv2.imread(os.path.join(background_folder, background_frames[i + 1]))
+        if img1 is None or img2 is None:
+            continue
+        img1_gray = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+        img2_gray = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+        K = np.array([[1000, 0, img1.shape[1] // 2],
+                      [0, 1000, img1.shape[0] // 2],
+                      [0, 0, 1]])
+        rvec, t = estimate_camera_pose(img1_gray, img2_gray, K)
+        if rvec is not None and t is not None:
+            poses = pd.concat([poses, pd.DataFrame([[i, *rvec, *t]], columns=poses.columns)], ignore_index=True)
+    poses.to_csv(os.path.join(experiment_folder, 'camera_poses.csv'), index=False)
+    print(f"Camera poses saved to {os.path.join(experiment_folder, 'camera_poses.csv')}")
 
 def main():
     start = time.time()
@@ -172,22 +214,16 @@ def main():
         df = pd.DataFrame(df_rows, columns=df_columns)
         df.to_csv(csv_file_path, index=False)
 
-        # Call extract_pov.py for this video
-        pov_script = os.path.join(os.path.dirname(__file__), "extract_pov.py")
-        pov_image_dir = background_folder  # This is where inpainted backgrounds are saved
-        # Make sure the background frames are available before calling
-        if os.path.exists(pov_image_dir) and len(os.listdir(pov_image_dir)) > 0:
-            subprocess.run([
-                "python3", pov_script,
-                pov_image_dir,
-                experiment_folder
-            ], check=True)
+        # Compute camera poses directly here
+        if os.path.exists(background_folder) and len(os.listdir(background_folder)) > 0:
+            compute_camera_poses(background_folder, experiment_folder)
         else:
-            print(f"[!] No background frames found in {pov_image_dir}, skipping SfM for this video.")
-
+            print(f"[!] No background frames found in {background_folder}, skipping SfM for this video.")
 
     timing_df = pd.DataFrame(timing_data)
     timing_df.to_csv(timing_csv_path, index=False)
+
+    shutil.make_archive(experiment_folder, 'zip', experiment_folder)
 
 if __name__ == "__main__":
     main()
