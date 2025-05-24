@@ -99,6 +99,44 @@ def compute_camera_poses(background_folder, experiment_folder):
     poses.to_csv(os.path.join(experiment_folder, 'camera_poses.csv'), index=False)
     print(f"Camera poses saved to {os.path.join(experiment_folder, 'camera_poses.csv')}")
 
+def compute_camera_poses(background_folder, experiment_folder):
+    """Run COLMAP to estimate camera poses from inpainted background frames."""
+    sparse_dir = os.path.join(experiment_folder, 'sparse')
+    database_path = os.path.join(experiment_folder, 'colmap.db')
+    image_path = background_folder
+
+    os.makedirs(sparse_dir, exist_ok=True)
+
+    print("[COLMAP] Creating database and extracting features...")
+
+    subprocess.run([
+        'colmap', 'feature_extractor',
+        '--database_path', database_path,
+        '--image_path', image_path,
+        '--ImageReader.single_camera', '1',
+        '--ImageReader.camera_model', 'PINHOLE',
+        '--SiftExtraction.use_gpu', '1'
+    ], check=True)
+
+    print("[COLMAP] Matching features...")
+
+    subprocess.run([
+        'colmap', 'exhaustive_matcher',
+        '--database_path', database_path,
+        '--SiftMatching.use_gpu', '1'
+    ], check=True)
+
+    print("[COLMAP] Running SfM...")
+
+    subprocess.run([
+        'colmap', 'mapper',
+        '--database_path', database_path,
+        '--image_path', image_path,
+        '--output_path', sparse_dir
+    ], check=True)
+
+    print(f"[COLMAP] Finished. Results in {sparse_dir}")
+
 def load_model(model_path):
     """Load a YOLO model from the given path."""
     if 'yolo' in model_path:
@@ -115,7 +153,7 @@ def setup_experiment(working_dir, vid):
     os.makedirs(background_folder, exist_ok=True)
     return experiment_folder, background_folder, objects_folder
 
-def process_video(video_path, experiment_folder, estimation_model, device):
+def process_video(video_path, objects_folder, background_folder, estimation_model, device):
     """Process the video for keypoint extraction."""
     frame_id = 0
     df_rows = []
@@ -162,22 +200,36 @@ def process_video(video_path, experiment_folder, estimation_model, device):
     return df_rows, frame_id
 
 def segment_objects(objects_folder, segmentation_model, device, min_frames):
-    """Segment objects in the video frames."""
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        for obj in os.listdir(objects_folder):
-            obj_folder = os.path.join(objects_folder, obj)
-            if os.path.isdir(obj_folder):
-                # Delete people folders that are missing too many frames (should be every person besides protagonist)
-                if obj.startswith("person_") and len(os.listdir(obj_folder)) < min_frames:
-                    shutil.rmtree(obj_folder)
-                else:
-                    for img in os.listdir(obj_folder):
-                        img_path = os.path.join(obj_folder, img)
-                        img = cv2.imread(img_path)
-                        if img is not None:
-                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                            mask = generate_mask(img, segmentation_model, imgsz=img.shape[:2], device=device)
-                            cv2.imwrite(img_path.replace('.png', '_mask.png'), mask)
+    """Segment objects in the video frames and create transparent PNGs."""
+    for obj in os.listdir(objects_folder):
+        obj_folder = os.path.join(objects_folder, obj)
+        if os.path.isdir(obj_folder):
+            # Delete people folders that are missing too many frames
+            if obj.startswith("person_") and len(os.listdir(obj_folder)) < min_frames:
+                shutil.rmtree(obj_folder)
+            else:
+                for img_file in os.listdir(obj_folder):
+                    if not img_file.endswith('.png') or '_mask' in img_file or '_transparent' in img_file:
+                        continue
+                        
+                    img_path = os.path.join(obj_folder, img_file)
+                    img = cv2.imread(img_path)
+                    if img is not None:
+                        # Generate mask using the segmentation model
+                        mask = generate_mask(img, segmentation_model, imgsz=img.shape[:2], device=device)
+                        
+                        # Save the mask for reference
+                        mask_path = img_path.replace('.png', '_mask.png')
+                        cv2.imwrite(mask_path, mask)
+                        
+                        # Create transparent PNG
+                        rgba = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+                        # Set alpha channel based on the mask (255 for person, 0 for background)
+                        rgba[:, :, 3] = mask
+                        
+                        # Save transparent PNG
+                        transparent_path = img_path.replace('.png', '_transparent.png')
+                        cv2.imwrite(transparent_path, rgba)
 
 def save_detection_data(df_rows, csv_file_path):
     """Save detection data to CSV."""
@@ -211,7 +263,7 @@ def main():
         
         # Process video (keypoint extraction)
         estimation_start = time.time()
-        df_rows, frame_count = process_video(video_path, experiment_folder, estimation_model, device)
+        df_rows, frame_count = process_video(video_path, objects_folder, background_folder, estimation_model, device)
         estimation_time = time.time() - estimation_start
         timing_data.append({
             "video": vid,
