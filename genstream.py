@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 import subprocess
 import sys
+import glob
+
 
 def extract_people(result):
     """Extracts person info (ID, confidence, bbox, keypoints) from a YOLO result into a dictionary."""
@@ -99,20 +101,34 @@ def compute_camera_poses(background_folder, experiment_folder):
     poses.to_csv(os.path.join(experiment_folder, 'camera_poses.csv'), index=False)
     print(f"Camera poses saved to {os.path.join(experiment_folder, 'camera_poses.csv')}")
 
-def compute_camera_poses(background_folder, experiment_folder):
-    """Run COLMAP to estimate camera poses from inpainted background frames."""
+def compute_camera_poses(background_folder, experiment_folder, frame_stride=1):
+    """Run COLMAP to estimate camera poses from inpainted background frames.
+
+    Args:
+        background_folder (str): Path to folder with full background frames.
+        experiment_folder (str): Path where COLMAP outputs will go.
+        frame_stride (int): Use every N-th frame (default=1, i.e., use all).
+    """
     sparse_dir = os.path.join(experiment_folder, 'sparse')
     database_path = os.path.join(experiment_folder, 'colmap.db')
-    image_path = background_folder
-
+    colmap_image_path = os.path.join(experiment_folder, 'colmap_images')
     os.makedirs(sparse_dir, exist_ok=True)
+    os.makedirs(colmap_image_path, exist_ok=True)
+
+    print(f"[COLMAP] Preparing input frames with stride {frame_stride}...")
+
+    # Copy every N-th frame to a new folder for COLMAP
+    all_frames = sorted(glob.glob(os.path.join(background_folder, '*')))
+    selected_frames = all_frames[::frame_stride]
+    for frame in selected_frames:
+        shutil.copy(frame, os.path.join(colmap_image_path, os.path.basename(frame)))
 
     print("[COLMAP] Creating database and extracting features...")
 
     subprocess.run([
         'colmap', 'feature_extractor',
         '--database_path', database_path,
-        '--image_path', image_path,
+        '--image_path', colmap_image_path,
         '--ImageReader.single_camera', '1',
         '--ImageReader.camera_model', 'PINHOLE',
         '--SiftExtraction.use_gpu', '1'
@@ -131,12 +147,11 @@ def compute_camera_poses(background_folder, experiment_folder):
     subprocess.run([
         'colmap', 'mapper',
         '--database_path', database_path,
-        '--image_path', image_path,
+        '--image_path', colmap_image_path,
         '--output_path', sparse_dir
     ], check=True)
 
     print(f"[COLMAP] Finished. Results in {sparse_dir}")
-
 def load_model(model_path):
     """Load a YOLO model from the given path."""
     if 'yolo' in model_path:
@@ -289,7 +304,7 @@ def main():
         
         # Compute camera poses
         if os.path.exists(background_folder) and len(os.listdir(background_folder)) > 0:
-            compute_camera_poses(background_folder, experiment_folder)
+            compute_camera_poses(background_folder, experiment_folder, frame_stride=30)
         else:
             print(f"[!] No background frames found in {background_folder}, skipping SfM for this video.")
     
