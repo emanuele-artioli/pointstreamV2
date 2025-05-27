@@ -16,21 +16,50 @@ def extract_people(result):
     boxes = getattr(result, 'boxes', [])
     keypoints = getattr(result, 'keypoints', [])
     people = {}
+
     for i, box in enumerate(boxes):
         obj_id = int(box.id) if box.id is not None else 9999
+        x1, y1, x2, y2 = tuple(map(int, box.xyxy[0]))
+        kpts = keypoints.xy[i].cpu().numpy().astype(np.uint8) if keypoints and i < len(keypoints.data) else None
+
+        # Expand bounding box if keypoints are missing
+        if kpts is not None:
+            head_indices = [0, 1, 2, 3, 4]
+            foot_indices = [15, 16]
+
+            h = y2 - y1
+            w = x2 - x1
+            center_x = x1 + w / 2
+
+            def detect_missing_kpt(id):
+                # Check if keypoint of given id is zero (missing)
+                return kpts[id][0] == 0 and kpts[id][1] == 0
+
+            # Expand up for missing head keypoints
+            if any(detect_missing_kpt(i) for i in head_indices):
+                y1 = max(0, y1 - int(0.3 * h))
+
+            # Expand down a bit since skates are too tall
+            y2 += int(0.1 * h)
+            # Expand down for missing foot keypoints
+            if any(detect_missing_kpt(i) for i in foot_indices):
+                y2 += int(0.3 * h)
+
+        # Save updated dictionary
         obj = {
             'conf': float(box.conf),
-            'bbox': tuple(map(int, box.xyxy[0])),
-            'keypoints': keypoints.xy[i].cpu().numpy().astype(np.uint8) if keypoints and i < len(keypoints.data) else None
+            'bbox': (x1, y1, x2, y2),
+            'keypoints': kpts
         }
         people[obj_id] = obj
+
     return people
 
 def save_object(object_id, object, obj_img, experiment_folder, frame_id):
     '''Save an object to its subfolder and log its bounding box coordinates.'''
     obj_folder = os.path.join(experiment_folder, f'person_{object_id}')
     os.makedirs(obj_folder, exist_ok=True)
-    cv2.imwrite(os.path.join(obj_folder, f'{frame_id}.png'), obj_img)
+    cv2.imwrite(os.path.join(obj_folder, f'{frame_id:04d}.png'), obj_img)
     x1, y1, x2, y2 = object['bbox']
     obj_info = [frame_id, object_id, 'person', x1, y1, x2, y2] 
     if object['keypoints'] is not None:
@@ -152,6 +181,7 @@ def compute_camera_poses(background_folder, experiment_folder, frame_stride=1):
     ], check=True)
 
     print(f"[COLMAP] Finished. Results in {sparse_dir}")
+
 def load_model(model_path):
     """Load a YOLO model from the given path."""
     if 'yolo' in model_path:
@@ -174,14 +204,14 @@ def process_video(video_path, objects_folder, background_folder, estimation_mode
     df_rows = []
     results = estimation_model.track(
         source = video_path,
-        conf = 0.25,
+        conf = 0.5,
         iou = 0.1,
-        imgsz = 640,
+        imgsz = 1920,
         half = 'cuda' in device,
         device = device,
-        batch = 10,
+        batch = 1,
         max_det = 30,
-        classes = [0], # person
+        # classes = [0], # person
         retina_masks = True,
         stream = True,
         persist = True,
@@ -207,10 +237,10 @@ def process_video(video_path, objects_folder, background_folder, estimation_mode
             x1, y1, x2, y2 = person["bbox"]
             mask[y1:y2, x1:x2] = 255
             inpainted = cv2.inpaint(frame_img, mask, 3, cv2.INPAINT_TELEA)
-            cv2.imwrite(os.path.join(background_folder, f'{frame_id}.png'), inpainted)
+            cv2.imwrite(os.path.join(background_folder, f'{frame_id:04d}.png'), inpainted)
         else:
             # protagonist not found in this frame, optionally handle this case
-            cv2.imwrite(os.path.join(background_folder, f'{frame_id}.png'), frame_img)
+            cv2.imwrite(os.path.join(background_folder, f'{frame_id:04d}.png'), frame_img)
 
     return df_rows, frame_id
 
@@ -304,13 +334,16 @@ def main():
         
         # Compute camera poses
         if os.path.exists(background_folder) and len(os.listdir(background_folder)) > 0:
-            compute_camera_poses(background_folder, experiment_folder, frame_stride=30)
+            try:
+                compute_camera_poses(background_folder, experiment_folder, frame_stride=30)
+            except Exception as e:
+                print(f"[!] Error during COLMAP processing for {vid}: {e}")
         else:
             print(f"[!] No background frames found in {background_folder}, skipping SfM for this video.")
     
-    # Save timing data and create archive
-    pd.DataFrame(timing_data).to_csv(timing_csv_path, index=False)
-    shutil.make_archive(experiment_folder, 'zip', experiment_folder)
+        # Save timing data and create archive
+        pd.DataFrame(timing_data).to_csv(timing_csv_path, index=False)
+        shutil.make_archive(experiment_folder, 'zip', experiment_folder)
 
 if __name__ == "__main__":
     main()
