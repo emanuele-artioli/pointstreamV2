@@ -1,9 +1,8 @@
 import os
-import time
 import cv2
 import shutil
 import concurrent.futures
-from ultralytics import YOLO
+from ultralytics import YOLO, SAM
 import numpy as np
 import pandas as pd
 import subprocess
@@ -11,124 +10,49 @@ import sys
 import glob
 
 
-def extract_people(result):
-    """Extracts person info (ID, confidence, bbox, keypoints) from a YOLO result into a dictionary."""
-    boxes = getattr(result, 'boxes', [])
-    keypoints = getattr(result, 'keypoints', [])
-    people = {}
+def load_model(model_path):
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file {model_path} does not exist.")
+    # if model path contains 'yolo', load YOLO model
+    if 'yolo' in model_path.lower():
+        try:
+            model = YOLO(model_path)
+            return model
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model from {model_path}: {e}")
+    elif 'sam' in model_path.lower():
+        try:
+            model = SAM(model_path)
+            return model
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model from {model_path}: {e}")
 
-    for i, box in enumerate(boxes):
-        obj_id = int(box.id) if box.id is not None else 9999
-        x1, y1, x2, y2 = tuple(map(int, box.xyxy[0]))
-        kpts = keypoints.xy[i].cpu().numpy().astype(np.uint8) if keypoints and i < len(keypoints.data) else None
 
-        # Expand bounding box if keypoints are missing
-        if kpts is not None:
-            head_indices = [0, 1, 2, 3, 4]
-            foot_indices = [15, 16]
+def setup_experiment(working_dir, video_name):
+    experiment_folder = os.path.join(working_dir, "experiments", video_name)
+    background_folder = os.path.join(experiment_folder, "background")
+    subject_folder = os.path.join(experiment_folder, "subject")
+    
+    if not os.path.exists(experiment_folder):
+        os.makedirs(experiment_folder)
+    if not os.path.exists(background_folder):
+        os.makedirs(background_folder)
+    if not os.path.exists(subject_folder):
+        os.makedirs(subject_folder)
+    
+    return experiment_folder, background_folder, subject_folder
 
-            h = y2 - y1
-            w = x2 - x1
-            center_x = x1 + w / 2
 
-            def detect_missing_kpt(id):
-                # Check if keypoint of given id is zero (missing)
-                return kpts[id][0] == 0 and kpts[id][1] == 0
+def inpaint_background(background):
+    """Inpaint the background using OpenCV's inpainting method."""
+    # Get the mask based on where the background is transparent
+    mask = background[:, :, 3]
+    mask = (mask == 0).astype(np.uint8) * 255  # Convert to binary mask (0 for transparent, 255 for opaque)
+    background = background[:, :, :3]  # Remove alpha channel for inpainting
+    # Inpaint the background using the mask
+    inpainted_background = cv2.inpaint(background, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+    return inpainted_background
 
-            # Expand up for missing head keypoints
-            if any(detect_missing_kpt(i) for i in head_indices):
-                y1 = max(0, y1 - int(0.3 * h))
-
-            # Expand down a bit since skates are too tall
-            y2 += int(0.1 * h)
-            # Expand down for missing foot keypoints
-            if any(detect_missing_kpt(i) for i in foot_indices):
-                y2 += int(0.3 * h)
-
-        # Save updated dictionary
-        obj = {
-            'conf': float(box.conf),
-            'bbox': (x1, y1, x2, y2),
-            'keypoints': kpts
-        }
-        people[obj_id] = obj
-
-    return people
-
-def save_object(object_id, object, obj_img, experiment_folder, frame_id):
-    '''Save an object to its subfolder and log its bounding box coordinates.'''
-    obj_folder = os.path.join(experiment_folder, f'person_{object_id}')
-    os.makedirs(obj_folder, exist_ok=True)
-    cv2.imwrite(os.path.join(obj_folder, f'{frame_id:04d}.png'), obj_img)
-    x1, y1, x2, y2 = object['bbox']
-    obj_info = [frame_id, object_id, 'person', x1, y1, x2, y2] 
-    if object['keypoints'] is not None:
-        keypoints = object['keypoints']
-        keypoints = keypoints.reshape(-1, 2)
-        obj_info.extend(keypoints.flatten().tolist())
-    return obj_info
-
-def generate_mask(img, model, conf=0.01, iou=0.01, imgsz=None, device=None):
-    '''Use YOLO to segment a person from the background.'''
-    results = model.predict(
-        source = img,
-        conf = conf,
-        iou = iou,
-        imgsz = imgsz,
-        half = 'cuda' in device,
-        device = device,
-        batch = 1,
-        max_det = 10,
-        classes = [0], # only person
-        retina_masks = True
-    )
-    mask = np.zeros(img.shape[:2], dtype=np.uint8)
-    if hasattr(results[0], 'masks') and results[0].masks is not None:
-        # Use the first mask (since we track only one person)
-        person_mask = results[0].masks.data[0].cpu().numpy().astype(np.uint8) * 255
-        mask = cv2.bitwise_or(mask, person_mask)
-    return mask
-
-def estimate_camera_pose(img1, img2, K):
-    sift = cv2.SIFT_create()
-    kp1, des1 = sift.detectAndCompute(img1, None)
-    kp2, des2 = sift.detectAndCompute(img2, None)
-    matcher = cv2.BFMatcher()
-    matches = matcher.knnMatch(des1, des2, k=2)
-    good = []
-    for m, n in matches:
-        if m.distance < 0.75 * n.distance:
-            good.append(m)
-    if len(good) < 5:
-        return None, None
-    pts1 = np.float32([kp1[m.queryIdx].pt for m in good])
-    pts2 = np.float32([kp2[m.trainIdx].pt for m in good])
-    E, mask = cv2.findEssentialMat(pts1, pts2, K, method=cv2.RANSAC)
-    if E is None:
-        return None, None
-    _, R, t, _ = cv2.recoverPose(E, pts1, pts2, K)
-    rvec, _ = cv2.Rodrigues(R)
-    return rvec.flatten(), t.flatten()
-
-def compute_camera_poses(background_folder, experiment_folder):
-    background_frames = [bg for bg in os.listdir(background_folder) if bg.endswith(('.jpg', '.png'))]
-    background_frames.sort()
-    poses = pd.DataFrame(columns=['frame_id', 'rvec_x', 'rvec_y', 'rvec_z', 't_x', 't_y', 't_z'])
-    for i in range(len(background_frames) - 1):
-        img1 = cv2.imread(os.path.join(background_folder, background_frames[i]))
-        img2 = cv2.imread(os.path.join(background_folder, background_frames[i + 1]))
-        if img1 is None or img2 is None:
-            continue
-        img1_gray = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
-        img2_gray = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
-        K = np.array([[1000, 0, img1.shape[1] // 2],
-                      [0, 1000, img1.shape[0] // 2],
-                      [0, 0, 1]])
-        rvec, t = estimate_camera_pose(img1_gray, img2_gray, K)
-        if rvec is not None and t is not None:
-            poses = pd.concat([poses, pd.DataFrame([[i, *rvec, *t]], columns=poses.columns)], ignore_index=True)
-    poses.to_csv(os.path.join(experiment_folder, 'camera_poses.csv'), index=False)
-    print(f"Camera poses saved to {os.path.join(experiment_folder, 'camera_poses.csv')}")
 
 def compute_camera_poses(background_folder, experiment_folder, frame_stride=1):
     """Run COLMAP to estimate camera poses from inpainted background frames.
@@ -182,168 +106,110 @@ def compute_camera_poses(background_folder, experiment_folder, frame_stride=1):
 
     print(f"[COLMAP] Finished. Results in {sparse_dir}")
 
-def load_model(model_path):
-    """Load a YOLO model from the given path."""
-    if 'yolo' in model_path:
-        return YOLO(model_path)
-    else:
-        raise ValueError('Model not supported.')
-
-def setup_experiment(working_dir, vid):
-    """Set up the experiment directories for a given video."""
-    experiment_folder = f'{working_dir}/experiments/{os.path.basename(vid).split(".")[0]}'
-    background_folder = os.path.join(experiment_folder, 'background')
-    objects_folder = os.path.join(experiment_folder, 'objects')
-    os.makedirs(objects_folder, exist_ok=True)
-    os.makedirs(background_folder, exist_ok=True)
-    return experiment_folder, background_folder, objects_folder
-
-def process_video(video_path, objects_folder, background_folder, estimation_model, device):
-    """Process the video for keypoint extraction."""
-    frame_id = 0
-    df_rows = []
-    results = estimation_model.track(
-        source = video_path,
-        conf = 0.5,
-        iou = 0.1,
-        imgsz = 1920,
-        half = 'cuda' in device,
-        device = device,
-        batch = 1,
-        max_det = 30,
-        # classes = [0], # person
-        retina_masks = True,
-        stream = True,
-        persist = True,
-    )
-
-    protagonist_id = None  # Track the protagonist's object id
-
-    for frame_id, result in enumerate(results):
-        frame_img = result.orig_img
-        people = extract_people(result)
-
-        # On the first frame, pick the first detected person as the protagonist
-        if protagonist_id is None and people:
-            protagonist_id = next(iter(people.keys()))
-
-        # Only process the protagonist in subsequent frames
-        if protagonist_id in people:
-            person = people[protagonist_id]
-            person_img = frame_img[person['bbox'][1]:person['bbox'][3], person['bbox'][0]:person['bbox'][2]]
-            df_rows.append(save_object(protagonist_id, person, person_img, objects_folder, frame_id))
-            # Remove the protagonist from the background and inpaint
-            mask = np.zeros(frame_img.shape[:2], dtype=np.uint8)
-            x1, y1, x2, y2 = person["bbox"]
-            mask[y1:y2, x1:x2] = 255
-            inpainted = cv2.inpaint(frame_img, mask, 3, cv2.INPAINT_TELEA)
-            cv2.imwrite(os.path.join(background_folder, f'{frame_id:04d}.png'), inpainted)
-        else:
-            # protagonist not found in this frame, optionally handle this case
-            cv2.imwrite(os.path.join(background_folder, f'{frame_id:04d}.png'), frame_img)
-
-    return df_rows, frame_id
-
-def segment_objects(objects_folder, segmentation_model, device, min_frames):
-    """Segment objects in the video frames and create transparent PNGs."""
-    for obj in os.listdir(objects_folder):
-        obj_folder = os.path.join(objects_folder, obj)
-        if os.path.isdir(obj_folder):
-            # Delete people folders that are missing too many frames
-            if obj.startswith("person_") and len(os.listdir(obj_folder)) < min_frames:
-                shutil.rmtree(obj_folder)
-            else:
-                for img_file in os.listdir(obj_folder):
-                    if not img_file.endswith('.png') or '_mask' in img_file or '_transparent' in img_file:
-                        continue
-                        
-                    img_path = os.path.join(obj_folder, img_file)
-                    img = cv2.imread(img_path)
-                    if img is not None:
-                        # Generate mask using the segmentation model
-                        mask = generate_mask(img, segmentation_model, imgsz=img.shape[:2], device=device)
-                        
-                        # Save the mask for reference
-                        mask_path = img_path.replace('.png', '_mask.png')
-                        cv2.imwrite(mask_path, mask)
-                        
-                        # Create transparent PNG
-                        rgba = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
-                        # Set alpha channel based on the mask (255 for person, 0 for background)
-                        rgba[:, :, 3] = mask
-                        
-                        # Save transparent PNG
-                        transparent_path = img_path.replace('.png', '_transparent.png')
-                        cv2.imwrite(transparent_path, rgba)
-
-def save_detection_data(df_rows, csv_file_path):
-    """Save detection data to CSV."""
-    df_columns = ['frame_id', 'object_id', 'class_id', 'x1', 'y1', 'x2', 'y2']
-    if df_rows and isinstance(df_rows[0], list) and len(df_rows[0]) > 7:
-        keypoints_count = (len(df_rows[0]) - 7) // 2
-        for i in range(keypoints_count):
-            df_columns.extend([f'keypoint_{i}_x', f'keypoint_{i}_y'])
-    pd.DataFrame(df_rows, columns=df_columns).to_csv(csv_file_path, index=False)
 
 def main():
-    start = time.time()
-    timing_data = []
     device = os.environ.get("DEVICE", "cuda")
     working_dir = os.environ.get("WORKING_DIR", "/PointStream")
     video_folder = os.environ.get("VIDEO_FOLDER", "/scenes")
-    timing_csv_path = os.path.join(working_dir, "experiments/timing_data.csv")
     
     # Get video list
     video_file = os.environ.get("VIDEO_FILE")
     all_videos = [video_file] if video_file else [v for v in os.listdir(video_folder) if v.endswith(('.mp4','.mov','.avi'))]
     
     # Load models
+    detection_model = load_model(os.environ.get("DET_MODEL"))
     estimation_model = load_model(os.environ.get("EST_MODEL"))
     segmentation_model = load_model(os.environ.get("SEG_MODEL"))
-    
+
     for vid in all_videos:
+        # Parse the video first to detect the bounding box's center of the figure skater (the largest person)
         video_path = os.path.join(video_folder, vid)
-        experiment_folder, background_folder, objects_folder = setup_experiment(working_dir, vid)
+        experiment_folder, background_folder, subject_folder = setup_experiment(working_dir, vid)
         csv_file_path = os.path.join(experiment_folder, 'bounding_boxes.csv')
-        
-        # Process video (keypoint extraction)
-        estimation_start = time.time()
-        df_rows, frame_count = process_video(video_path, objects_folder, background_folder, estimation_model, device)
-        estimation_time = time.time() - estimation_start
-        timing_data.append({
-            "video": vid,
-            "task": "keypoint_extraction",
-            "time_taken": estimation_time,
-            "fps": frame_count / estimation_time if estimation_time > 0 else 0
-        })
-        
-        # Segment objects
-        segmentation_start = time.time()
-        min_frames = frame_count * 0.9
-        segment_objects(objects_folder, segmentation_model, device, min_frames)
-        segmentation_time = time.time() - segmentation_start
-        timing_data.append({
-            "video": vid,
-            "task": "segmentation",
-            "time_taken": segmentation_time,
-            "fps": frame_count / segmentation_time if segmentation_time > 0 else 0
-        })
-        
-        # Save bounding boxes and keypoints
-        save_detection_data(df_rows, csv_file_path)
-        
-        # Compute camera poses
-        if os.path.exists(background_folder) and len(os.listdir(background_folder)) > 0:
-            try:
-                compute_camera_poses(background_folder, experiment_folder, frame_stride=30)
-            except Exception as e:
-                print(f"[!] Error during COLMAP processing for {vid}: {e}")
-        else:
-            print(f"[!] No background frames found in {background_folder}, skipping SfM for this video.")
-    
-        # Save timing data and create archive
-        pd.DataFrame(timing_data).to_csv(timing_csv_path, index=False)
-        shutil.make_archive(experiment_folder, 'zip', experiment_folder)
+        # Create a DataFrame with columns for each keypoint coordinates
+        keypoint_columns = [f'keypoint_{i}_{coord}' for i in range(17) for coord in ['x', 'y']]
+        df_columns = ['frame_id'] + keypoint_columns
+        pose_df = pd.DataFrame(columns=df_columns)
+
+        results = detection_model.track(
+            source=video_path,
+            conf=0.25,
+            iou=0.4,
+            imgsz=1920,
+            half='cuda' in device,
+            device=device,
+            batch=1,
+            max_det=30,
+            classes=[0],  # class 0 is 'person'
+            retina_masks=True,
+            stream=True
+        )
+        os.makedirs(experiment_folder, exist_ok=True)
+        for frame_id, result in enumerate(results):
+            frame_img = result.orig_img
+            boxes = getattr(result, 'boxes', [])
+            # calculate largest bounding box
+            if boxes:
+                largest_box = max(boxes, key=lambda b: (b.xyxy[0][2] - b.xyxy[0][0]) * (b.xyxy[0][3] - b.xyxy[0][1]))
+                x1, y1, x2, y2 = tuple(map(int, largest_box.xyxy[0]))
+                # Expand the bounding box by a bit to ensure the subject is fully captured
+                width = x2 - x1
+                height = y2 - y1
+                x1 = max(0, int(x1 - 0.1 * width))
+                y1 = max(0, int(y1 - 0.1 * height))
+                x2 = min(frame_img.shape[1], int(x2 + 0.1 * width))
+                y2 = min(frame_img.shape[0], int(y2 + 0.1 * height))
+                
+                # Call segmentation model to separate the subject from the background
+                seg_results = segmentation_model(frame_img, bboxes=[[x1, y1, x2, y2]])
+                if seg_results:
+                    # Create alpha channels
+                    person_alpha = seg_results[0].masks.data.cpu().numpy().astype(np.int16).reshape(frame_img.shape[0], frame_img.shape[1])
+                    background_alpha = (person_alpha - 1) * -1  # Invert mask for background
+                    person_alpha = (person_alpha * 255).astype(np.uint8)  # Convert to 0-255 range
+                    background_alpha = (background_alpha * 255).astype(np.uint8)  # Convert to 0-255 range
+
+                    # Add alpha to RGB frame
+                    person_rgba = cv2.merge((frame_img, person_alpha))
+                    background_rgba = cv2.merge((frame_img, background_alpha))
+
+                    # Set transparent pixels to black for RGB channels
+                    person_rgba[person_rgba[:, :, 3] == 0, :3] = 0
+                    background_rgba[background_rgba[:, :, 3] == 0, :3] = 0
+
+                    # Inpaint the background
+                    inpainted_background = inpaint_background(background_rgba)
+
+                    # Save images
+                    cv2.imwrite(os.path.join(subject_folder, f'{frame_id:04d}.png'), person_rgba)
+                    cv2.imwrite(os.path.join(background_folder, f'{frame_id:04d}.png'), inpainted_background)
+
+                # Call estimation model on the separated subject
+                est_results = estimation_model(
+                    source=os.path.join(subject_folder, f'{frame_id:04d}.png'),
+                    conf=0.25,
+                    iou=0.4,
+                    imgsz=1920,
+                    half='cuda' in device,
+                    device=device,
+                    batch=1,
+                    max_det=1,
+                    retina_masks=True,
+                    stream=True
+                )
+                for i, result in enumerate(est_results):
+                    if hasattr(result, 'keypoints'):
+                        keypoints = result.keypoints.xy[i].cpu().numpy().astype(np.uint16)
+                    # Save the pose estimation results
+                    pose_row = [frame_id] + keypoints.flatten().tolist()
+                    pose_df.loc[len(pose_df)] = pose_row
+        # Save the bounding boxes to a CSV file
+        pose_df.to_csv(csv_file_path, index=False)
+
+
+        # Compute camera poses using COLMAP
+        compute_camera_poses(background_folder, experiment_folder, frame_stride=10)
+
 
 if __name__ == "__main__":
     main()
