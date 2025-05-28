@@ -199,7 +199,7 @@ def main():
                 )
                 for i, result in enumerate(est_results):
                     if hasattr(result, 'keypoints'):
-                        keypoints = result.keypoints.xy[i].cpu().numpy().astype(np.uint16)
+                        keypoints = result.keypoints.xy[i].cpu().numpy().astype(np.uint16) if result.keypoints.xy[i].shape[0] > 0 else np.zeros((17, 2), dtype=np.uint16)
                     # Save the pose estimation results
                     pose_row = [frame_id] + keypoints.flatten().tolist()
                     pose_df.loc[len(pose_df)] = pose_row
