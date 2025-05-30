@@ -8,6 +8,7 @@ import pandas as pd
 import subprocess
 import sys
 import glob
+import time
 
 
 def load_model(model_path):
@@ -35,6 +36,9 @@ def setup_experiment(working_dir, video_name):
     
     if not os.path.exists(experiment_folder):
         os.makedirs(experiment_folder)
+    else:
+        # Set experiment folder as empty 
+        experiment_folder = ""
     if not os.path.exists(background_folder):
         os.makedirs(background_folder)
     if not os.path.exists(subject_folder):
@@ -116,21 +120,36 @@ def main():
     video_file = os.environ.get("VIDEO_FILE")
     all_videos = [video_file] if video_file else [v for v in os.listdir(video_folder) if v.endswith(('.mp4','.mov','.avi'))]
     
+    # Timing dictionary
+    timings = {}
+
     # Load models
+    t0 = time.time()
     detection_model = load_model(os.environ.get("DET_MODEL"))
+    timings['load_detection_model'] = time.time() - t0
+
+    t0 = time.time()
     estimation_model = load_model(os.environ.get("EST_MODEL"))
+    timings['load_estimation_model'] = time.time() - t0
+
+    t0 = time.time()
     segmentation_model = load_model(os.environ.get("SEG_MODEL"))
+    timings['load_segmentation_model'] = time.time() - t0
 
     for vid in all_videos:
-        # Parse the video first to detect the bounding box's center of the figure skater (the largest person)
+        video_timings = {}
         video_path = os.path.join(video_folder, vid)
         experiment_folder, background_folder, subject_folder = setup_experiment(working_dir, vid)
+        if not experiment_folder:
+            print(f"Experiment folder already exists for {vid}, skipping...")
+            continue
         csv_file_path = os.path.join(experiment_folder, 'bounding_boxes.csv')
-        # Create a DataFrame with columns for each keypoint coordinates
         keypoint_columns = [f'keypoint_{i}_{coord}' for i in range(17) for coord in ['x', 'y']]
         df_columns = ['frame_id'] + keypoint_columns
         pose_df = pd.DataFrame(columns=df_columns)
 
+        # Detection and segmentation timing
+        t0 = time.time()
         results = detection_model.track(
             source=video_path,
             conf=0.25,
@@ -148,11 +167,9 @@ def main():
         for frame_id, result in enumerate(results):
             frame_img = result.orig_img
             boxes = getattr(result, 'boxes', [])
-            # calculate largest bounding box
             if boxes:
                 largest_box = max(boxes, key=lambda b: (b.xyxy[0][2] - b.xyxy[0][0]) * (b.xyxy[0][3] - b.xyxy[0][1]))
                 x1, y1, x2, y2 = tuple(map(int, largest_box.xyxy[0]))
-                # Expand the bounding box by a bit to ensure the subject is fully captured
                 width = x2 - x1
                 height = y2 - y1
                 x1 = max(0, int(x1 - 0.1 * width))
@@ -160,31 +177,19 @@ def main():
                 x2 = min(frame_img.shape[1], int(x2 + 0.1 * width))
                 y2 = min(frame_img.shape[0], int(y2 + 0.1 * height))
                 
-                # Call segmentation model to separate the subject from the background
                 seg_results = segmentation_model(frame_img, bboxes=[[x1, y1, x2, y2]])
                 if seg_results:
-                    # Create alpha channels
                     person_alpha = seg_results[0].masks.data.cpu().numpy().astype(np.int16).reshape(frame_img.shape[0], frame_img.shape[1])
-                    background_alpha = (person_alpha - 1) * -1  # Invert mask for background
-                    person_alpha = (person_alpha * 255).astype(np.uint8)  # Convert to 0-255 range
-                    background_alpha = (background_alpha * 255).astype(np.uint8)  # Convert to 0-255 range
-
-                    # Add alpha to RGB frame
+                    background_alpha = (person_alpha - 1) * -1
+                    person_alpha = (person_alpha * 255).astype(np.uint8)
+                    background_alpha = (background_alpha * 255).astype(np.uint8)
                     person_rgba = cv2.merge((frame_img, person_alpha))
                     background_rgba = cv2.merge((frame_img, background_alpha))
-
-                    # Set transparent pixels to black for RGB channels
                     person_rgba[person_rgba[:, :, 3] == 0, :3] = 0
                     background_rgba[background_rgba[:, :, 3] == 0, :3] = 0
-
-                    # Inpaint the background
                     inpainted_background = inpaint_background(background_rgba)
-
-                    # Save images
                     cv2.imwrite(os.path.join(subject_folder, f'{frame_id:04d}.png'), person_rgba)
                     cv2.imwrite(os.path.join(background_folder, f'{frame_id:04d}.png'), inpainted_background)
-
-                # Call estimation model on the separated subject
                 est_results = estimation_model(
                     source=os.path.join(subject_folder, f'{frame_id:04d}.png'),
                     conf=0.25,
@@ -200,16 +205,24 @@ def main():
                 for i, result in enumerate(est_results):
                     if hasattr(result, 'keypoints'):
                         keypoints = result.keypoints.xy[i].cpu().numpy().astype(np.uint16) if result.keypoints.xy[i].shape[0] > 0 else np.zeros((17, 2), dtype=np.uint16)
-                    # Save the pose estimation results
                     pose_row = [frame_id] + keypoints.flatten().tolist()
                     pose_df.loc[len(pose_df)] = pose_row
-        # Save the bounding boxes to a CSV file
+        video_timings['detection_and_segmentation'] = time.time() - t0
+
+        t0 = time.time()
         pose_df.to_csv(csv_file_path, index=False)
+        video_timings['save_csv'] = time.time() - t0
 
+        t0 = time.time()
+        compute_camera_poses(background_folder, experiment_folder, frame_stride=5)
+        video_timings['colmap'] = time.time() - t0
 
-        # Compute camera poses using COLMAP
-        compute_camera_poses(background_folder, experiment_folder, frame_stride=10)
+        # Save timings for this video
+        timings[vid] = video_timings
 
+        # Save timings to CSV
+        timings_df = pd.DataFrame.from_dict(timings, orient='index')
+        timings_df.to_csv(os.path.join(experiment_folder, 'timings.csv'))
 
 if __name__ == "__main__":
     main()
